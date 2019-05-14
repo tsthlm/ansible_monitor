@@ -1,0 +1,199 @@
+- name: Stop the old containers
+  shell: docker stop {{ item }}
+  ignore_errors: true
+  with_items: 
+    - tsdb_metrics_import
+    - tsdb_grafana
+    - tsdb_prometheus
+    - tsdb_influxdb
+  tags:
+     - teardown
+
+- name: remove the containers
+  shell: docker rm {{ item }}
+  ignore_errors: true
+  with_items: 
+    - tsdb_metrics_import
+    - tsdb_grafana
+    - tsdb_prometheus
+    - tsdb_influxdb
+  tags:
+     - teardown
+
+- name: create data directory
+  file: path=/var/lib/influxdb state=directory mode=0755 owner=1000 group=1000
+  become: true
+  tags:
+     - deploy
+
+- name: start influxdb container
+  docker_container:
+    name: tsdb_influxdb
+    image: "{{ influxdb_docker_image }}"
+    user: 1000:1000
+    privileged: no
+    network_mode: host    
+    restart_policy: always
+    state: started
+    env:
+     INFLUXDB_DB:               "{{ influxdb_databasename }}"
+     INFLUXDB_ADMIN_USER:       "{{ influxdb_admin_user }}"
+     INFLUXDB_ADMIN_PASSWORD:   "{{ influxdb_admin_password }}"
+     INFLUXDB_USER:             "{{ influxdb_user }}"
+     INFLUXDB_USER_PASSWORD:    "{{ influxdb_user_password }}"
+    volumes: 
+      - /etc/passwd:/etc/passwd:ro
+      - /var/lib/influxdb:/var/lib/influxdb:rw
+    published_ports:
+      - 8086:8086
+  tags:
+     - deploy
+
+- name: create offset storage dir
+  file: path=/var/lib/tsdb state=directory mode=0755 owner=1000 group=1000
+  become: true
+  tags:
+     - deploy
+
+- name: start prometheus import container
+  docker_container:
+    name: tsdb_metrics_import
+    image: "{{ bb_monitor_docker_image }}"
+    user: 1000:1000
+    privileged: no
+    network_mode: host
+    restart_policy: always
+    state: started
+    pull: yes
+    command: bb_promstore_exporter --offset_storage=/var/lib/tsdb/import-metrics.offset
+    env: 
+      APP_REALM:                "MON"
+      SRC_URI:                  "lb.bitbouncer.com:10063"
+      API_KEY:                  "{{ API_KEY }}"
+      DST_URI:                  "http://127.0.0.1:8086/api/v1/prom/write"
+      DB_DATABASE:              "{{ influxdb_databasename }}"
+      DB_USER:                  "{{ influxdb_user }}"
+      DB_PASSWORD:              "{{ influxdb_user_password }}"
+    volumes: 
+      - /var/lib/tsdb:/var/lib/tsdb:rw
+  tags:
+     - deploy
+
+- name: create /etc/prometheus directory
+  file: path=/etc/prometheus state=directory mode=0755
+  become: true
+  tags:
+     - deploy
+
+- name: create prometheus config file
+  template: src=prometheus.yml dest=/etc/prometheus/prometheus.yml mode=755
+  tags:
+     - deploy
+
+- name: import alerting rules
+  copy: src={{ role_path }}/files/{{ item }} dest=/etc/prometheus/{{ item }} mode=755
+  with_items: 
+    - first_rule.yml
+  tags:
+     - deploy
+
+- name: create prometheus data directory
+  file: path=/var/lib/prometheus state=directory mode=0755 owner=1000 group=1000
+  become: true
+  tags:
+     - deploy
+
+- name: start prometheus container
+  docker_container:
+    name: tsdb_prometheus
+    image: "{{ prometheus_docker_image }}"
+    user: 1000:1000
+    privileged: no
+    network_mode: host    
+    restart_policy: always
+    state: started
+    command: '--config.file=/etc/prometheus/prometheus.yml --storage.tsdb.path=/var/lib/prometheus'
+    volumes: 
+      - /etc/passwd:/etc/passwd:ro
+      - /etc/prometheus:/etc/prometheus:ro
+      - /var/lib/prometheus:/var/lib/prometheus:rw
+    published_ports:
+      - 9090:9090
+  tags:
+     - deploy
+
+- name: create /var/lib/grafana directory
+  file: path=/var/lib/grafana state=directory mode=0755 owner=1000 group=1000
+  become: true
+  tags:
+     - deploy
+
+- name: start grafana container
+  docker_container:
+    name: tsdb_grafana
+    image: "{{ grafana_docker_image }}"
+    network_mode: host    
+    user: 1000:1000
+    privileged: no
+    restart_policy: always
+    state: started
+    env:
+     GF_SECURITY_ADMIN_PASSWORD:  "{{ grafana_admin_password }}"
+    volumes: 
+      - /etc/passwd:/etc/passwd:ro
+      - /var/lib/grafana:/var/lib/grafana:rw
+    published_ports:
+      - 3000:3000
+  tags:
+     - deploy
+
+- name: "Check if Grafana is accessible."
+  uri:
+    url: http://127.0.0.1:3000
+    method: GET
+    status_code: 200
+
+- name: install plugins
+  shell: docker exec tsdb_grafana grafana-cli plugins install {{ item }}
+  with_items:
+   - vonage-status-panel
+
+- name: Create influxdb datasource
+  grafana_datasource:
+    name: "influxdb"
+    grafana_url: "http://localhost:3000"
+    grafana_user: "admin"
+    grafana_password: "{{ grafana_admin_password }}"
+    org_id: "1"
+    ds_type: "influxdb"
+    url: "http://localhost:8086"
+    database: "{{ influxdb_databasename }}"
+    time_interval: ">10s"
+    
+
+- name: Create prometheus datasource
+  grafana_datasource:
+    name: "prometheus"
+    grafana_url: "http://localhost:3000"
+    grafana_user: "admin"
+    grafana_password: "{{ grafana_admin_password }}"
+    org_id: "1"
+    ds_type: "prometheus"
+    url: "http://localhost:9090"
+
+- name: set influxdb retention (default seems to be 7days)
+  shell: docker exec tsdb_influxdb influx -execute "CREATE RETENTION POLICY mypolicy1 ON {{ influxdb_databasename }} DURATION 30d REPLICATION 1 DEFAULT"
+
+
+#- name: Import Grafana dashboard foo
+#  grafana_dashboard:
+#    grafana_url: http://localhost:3000
+#    grafana_user: "admin"
+#    grafana_password: "{{ grafana_admin_password }}"
+#    state: present
+#    message: Updated by ansible
+#    overwrite: yes
+#    path: dashboards/datadog.json
+
+
+
